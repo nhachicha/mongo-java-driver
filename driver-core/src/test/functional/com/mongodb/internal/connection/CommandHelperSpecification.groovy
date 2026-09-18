@@ -25,14 +25,13 @@ import com.mongodb.connection.SocketSettings
 import com.mongodb.internal.connection.netty.NettyStreamFactory
 import org.bson.BsonDocument
 import org.bson.BsonInt32
-import spock.lang.Ignore
 import spock.lang.Specification
 
 import java.util.concurrent.CountDownLatch
 
 import static com.mongodb.ClusterFixture.CLIENT_METADATA
 import static com.mongodb.ClusterFixture.LEGACY_HELLO
-import static com.mongodb.ClusterFixture.OPERATION_CONTEXT
+import static com.mongodb.ClusterFixture.createOperationContext
 import static com.mongodb.ClusterFixture.getClusterConnectionMode
 import static com.mongodb.ClusterFixture.getCredentialWithCache
 import static com.mongodb.ClusterFixture.getPrimary
@@ -49,7 +48,7 @@ class CommandHelperSpecification extends Specification {
                 new NettyStreamFactory(SocketSettings.builder().build(), getSslSettings()),
                 getCredentialWithCache(), CLIENT_METADATA, [], LoggerSettings.builder().build(), null, getServerApi())
                 .create(new ServerId(new ClusterId(), getPrimary()))
-        connection.open(OPERATION_CONTEXT)
+        connection.open(createOperationContext())
     }
 
     def cleanup() {
@@ -57,14 +56,13 @@ class CommandHelperSpecification extends Specification {
         connection?.close()
     }
 
-    @Ignore("JAVA-5982")
     def 'should execute command asynchronously'() {
         when:
         BsonDocument receivedDocument = null
         Throwable receivedException = null
         def latch1 = new CountDownLatch(1)
         executeCommandAsync('admin', new BsonDocument(LEGACY_HELLO, new BsonInt32(1)), getClusterConnectionMode(),
-                getServerApi(), connection, OPERATION_CONTEXT)
+                getServerApi(), connection, createOperationContext())
                 { document, exception -> receivedDocument = document; receivedException = exception; latch1.countDown() }
         latch1.await()
 
@@ -76,7 +74,7 @@ class CommandHelperSpecification extends Specification {
         when:
         def latch2 = new CountDownLatch(1)
         executeCommandAsync('admin', new BsonDocument('non-existent-command', new BsonInt32(1)), getClusterConnectionMode(),
-                getServerApi(), connection, OPERATION_CONTEXT)
+                getServerApi(), connection, createOperationContext())
                 { document, exception -> receivedDocument = document; receivedException = exception; latch2.countDown() }
         latch2.await()
 
@@ -84,5 +82,4 @@ class CommandHelperSpecification extends Specification {
         !receivedDocument
         receivedException instanceof MongoCommandException
     }
-
 }

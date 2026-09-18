@@ -24,6 +24,8 @@ import com.mongodb.ReadConcern;
 import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
 import com.mongodb.internal.TimeoutContext;
+import com.mongodb.internal.observability.micrometer.TracingManager;
+import com.mongodb.internal.observability.micrometer.TransactionSpan;
 import com.mongodb.internal.operation.AbortTransactionOperation;
 import com.mongodb.internal.operation.CommitTransactionOperation;
 import com.mongodb.internal.operation.ReadOperation;
@@ -39,6 +41,7 @@ import reactor.core.publisher.MonoSink;
 
 import static com.mongodb.MongoException.TRANSIENT_TRANSACTION_ERROR_LABEL;
 import static com.mongodb.MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL;
+import static com.mongodb.assertions.Assertions.assertFalse;
 import static com.mongodb.assertions.Assertions.assertNotNull;
 import static com.mongodb.assertions.Assertions.assertTrue;
 import static com.mongodb.assertions.Assertions.isTrue;
@@ -46,19 +49,24 @@ import static com.mongodb.assertions.Assertions.notNull;
 
 final class ClientSessionPublisherImpl extends BaseClientSessionImpl implements ClientSession {
 
-    private final MongoClientImpl mongoClient;
     private final OperationExecutor executor;
+    private final TracingManager tracingManager;
+    @Nullable
+    private final Integer maxAdaptiveRetriesSetting;
     private TransactionState transactionState = TransactionState.NONE;
     private boolean messageSentInCurrentTransaction;
     private boolean commitInProgress;
     private TransactionOptions transactionOptions;
+    @Nullable
+    private TransactionSpan transactionSpan;
 
 
     ClientSessionPublisherImpl(final ServerSessionPool serverSessionPool, final MongoClientImpl mongoClient,
-            final ClientSessionOptions options, final OperationExecutor executor) {
+            final ClientSessionOptions options, final OperationExecutor executor, final TracingManager tracingManager) {
         super(serverSessionPool, mongoClient, options);
         this.executor = executor;
-        this.mongoClient = mongoClient;
+        this.tracingManager = tracingManager;
+        maxAdaptiveRetriesSetting = mongoClient.getSettings().getMaxAdaptiveRetries();
     }
 
     @Override
@@ -71,7 +79,10 @@ final class ClientSessionPublisherImpl extends BaseClientSessionImpl implements 
         if (hasActiveTransaction()) {
             boolean firstMessageInCurrentTransaction = !messageSentInCurrentTransaction;
             messageSentInCurrentTransaction = true;
-            return firstMessageInCurrentTransaction;
+            OverloadRetryPolicyState.CommandExecutionScoped overloadRetryPolicyState = getOverloadRetryPolicyState().getCommandExecutionScoped();
+            return overloadRetryPolicyState == null
+                    ? firstMessageInCurrentTransaction
+                    : overloadRetryPolicyState.notifyMessageSent(firstMessageInCurrentTransaction);
         } else {
             if (transactionState == TransactionState.COMMITTED || transactionState == TransactionState.ABORTED) {
                 cleanupTransaction(TransactionState.NONE);
@@ -128,6 +139,10 @@ final class ClientSessionPublisherImpl extends BaseClientSessionImpl implements 
         if (!writeConcern.isAcknowledged()) {
             throw new MongoClientException("Transactions do not support unacknowledged write concern");
         }
+
+        if (tracingManager.isEnabled()) {
+            transactionSpan = new TransactionSpan(tracingManager);
+        }
         clearTransactionContext();
         setTimeoutContext(timeoutContext);
     }
@@ -151,7 +166,11 @@ final class ClientSessionPublisherImpl extends BaseClientSessionImpl implements 
                 return Mono.error(new IllegalStateException("There is no transaction started"));
             }
             if (!messageSentInCurrentTransaction) {
-                cleanupTransaction(TransactionState.COMMITTED);
+                transactionState = TransactionState.COMMITTED;
+                commitInProgress = false;
+                if (transactionSpan != null) {
+                    transactionSpan.finalizeTransactionSpan(TransactionState.COMMITTED.name());
+                }
                 return Mono.create(MonoSink::success);
             } else {
                 ReadConcern readConcern = transactionOptions.getReadConcern();
@@ -159,19 +178,32 @@ final class ClientSessionPublisherImpl extends BaseClientSessionImpl implements 
                     return Mono.error(new MongoInternalException("Invariant violated. Transaction options read concern can not be null"));
                 }
                 boolean alreadyCommitted = commitInProgress || transactionState == TransactionState.COMMITTED;
+                if (!alreadyCommitted) {
+                    getOverloadRetryPolicyState().openCommitScope();
+                }
                 commitInProgress = true;
                 resetTimeout();
                 TimeoutContext timeoutContext = getTimeoutContext();
                 WriteConcern writeConcern = assertNotNull(getWriteConcern(timeoutContext));
                 return executor
                         .execute(
-                                new CommitTransactionOperation(writeConcern, alreadyCommitted)
+                                new CommitTransactionOperation(writeConcern, maxAdaptiveRetriesSetting, alreadyCommitted)
                                         .recoveryToken(getRecoveryToken()), readConcern, this)
                         .doOnTerminate(() -> {
-                            commitInProgress = false;
                             transactionState = TransactionState.COMMITTED;
+                            commitInProgress = false;
                         })
-                        .doOnError(MongoException.class, this::clearTransactionContextOnError);
+                        .doOnError(MongoException.class, e -> {
+                            clearTransactionContextOnError(e);
+                            if (transactionSpan != null) {
+                                transactionSpan.handleTransactionSpanError(e);
+                            }
+                        })
+                        .doOnSuccess(v -> {
+                            if (transactionSpan != null) {
+                                transactionSpan.finalizeTransactionSpan(TransactionState.COMMITTED.name());
+                            }
+                        });
             }
         });
     }
@@ -191,6 +223,9 @@ final class ClientSessionPublisherImpl extends BaseClientSessionImpl implements 
             }
             if (!messageSentInCurrentTransaction) {
                 cleanupTransaction(TransactionState.ABORTED);
+                if (transactionSpan != null) {
+                    transactionSpan.finalizeTransactionSpan(TransactionState.ABORTED.name());
+                }
                 return Mono.create(MonoSink::success);
             } else {
                 ReadConcern readConcern = transactionOptions.getReadConcern();
@@ -202,12 +237,15 @@ final class ClientSessionPublisherImpl extends BaseClientSessionImpl implements 
                 TimeoutContext timeoutContext = getTimeoutContext();
                 WriteConcern writeConcern = assertNotNull(getWriteConcern(timeoutContext));
                 return executor
-                        .execute(new AbortTransactionOperation(writeConcern)
+                        .execute(new AbortTransactionOperation(writeConcern, maxAdaptiveRetriesSetting)
                                 .recoveryToken(getRecoveryToken()), readConcern, this)
                         .onErrorResume(Throwable.class, (e) -> Mono.empty())
                         .doOnTerminate(() -> {
                             clearTransactionContext();
                             cleanupTransaction(TransactionState.ABORTED);
+                            if (transactionSpan != null) {
+                                transactionSpan.finalizeTransactionSpan(TransactionState.ABORTED.name());
+                            }
                         });
             }
         });
@@ -217,6 +255,12 @@ final class ClientSessionPublisherImpl extends BaseClientSessionImpl implements 
         if (e.hasErrorLabel(TRANSIENT_TRANSACTION_ERROR_LABEL) || e.hasErrorLabel(UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)) {
             clearTransactionContext();
         }
+    }
+
+    @Override
+    @Nullable
+    public TransactionSpan getTransactionSpan() {
+        return transactionSpan;
     }
 
     @Override
@@ -231,7 +275,9 @@ final class ClientSessionPublisherImpl extends BaseClientSessionImpl implements 
     private void cleanupTransaction(final TransactionState nextState) {
         messageSentInCurrentTransaction = false;
         transactionOptions = null;
+        assertFalse(nextState == TransactionState.COMMITTED);
         transactionState = nextState;
+        getOverloadRetryPolicyState().closeCommitScope();
         setTimeoutContext(null);
     }
 

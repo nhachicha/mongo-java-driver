@@ -189,6 +189,12 @@ public final class Entities {
         return getEntity(id, databases, "database");
     }
 
+    public Set<String> getDatabaseNames() {
+        return databases.values().stream()
+                .map(MongoDatabase::getName)
+                .collect(Collectors.toSet());
+    }
+
     public boolean hasCollection(final String id) {
         return collections.containsKey(id);
     }
@@ -215,6 +221,10 @@ public final class Entities {
 
     public BsonDocument getSessionIdentifier(final String id) {
         return getEntity(id + "-identifier", sessionIdentifiers, "session identifier");
+    }
+
+    public boolean hasBucket(final String id) {
+        return buckets.containsKey(id);
     }
 
     public GridFSBucket getBucket(final String id) {
@@ -593,6 +603,7 @@ public final class Entities {
                     .observabilitySettings(ObservabilitySettings.micrometerBuilder()
                     .observationRegistry(observationRegistry)
                     .enableCommandPayloadTracing(enableCommandPayload).build());
+
         }
 
         MongoClientSettings clientSettings = clientSettingsBuilder.build();

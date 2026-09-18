@@ -28,6 +28,7 @@ import java.util.function.LongConsumer;
 
 import static com.mongodb.assertions.Assertions.assertNotNull;
 import static com.mongodb.assertions.Assertions.assertNull;
+import static com.mongodb.assertions.Assertions.assertTrue;
 import static com.mongodb.assertions.Assertions.isTrue;
 import static com.mongodb.internal.VisibleForTesting.AccessModifier.PRIVATE;
 import static com.mongodb.internal.time.Timeout.ZeroSemantics.ZERO_DURATION_MEANS_INFINITE;
@@ -39,8 +40,12 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
  * <p>The context for handling timeouts in relation to the Client Side Operation Timeout specification.</p>
  */
 public class TimeoutContext {
+    public static final String DEFAULT_TIMEOUT_MESSAGE = "Operation exceeded the timeout limit.";
     private static final int NO_ROUND_TRIP_TIME_MS = 0;
     private final TimeoutSettings timeoutSettings;
+    /**
+     * Is {@code null} iff {@link #timeoutSettings}{@code .}{@link TimeoutSettings#getTimeoutMS() getTimeoutMS()} is {@code null}.
+     */
     @Nullable
     private final Timeout timeout;
     @Nullable
@@ -60,11 +65,11 @@ public class TimeoutContext {
         throw new MongoOperationTimeoutException(message);
     }
     public static <T> T throwMongoTimeoutException() {
-        throw new MongoOperationTimeoutException("The operation exceeded the timeout limit.");
+        throw new MongoOperationTimeoutException(DEFAULT_TIMEOUT_MESSAGE);
     }
 
     public static MongoOperationTimeoutException createMongoTimeoutException(final Throwable cause) {
-        return createMongoTimeoutException("Operation exceeded the timeout limit: " + cause.getMessage(), cause);
+        return createMongoTimeoutException(DEFAULT_TIMEOUT_MESSAGE, cause);
     }
 
     public static MongoOperationTimeoutException createMongoTimeoutException(final String message, @Nullable final Throwable cause) {
@@ -109,10 +114,6 @@ public class TimeoutContext {
         this(false, timeoutSettings, startTimeout(timeoutSettings.getTimeoutMS()));
     }
 
-    private TimeoutContext(final TimeoutSettings timeoutSettings, @Nullable final Timeout timeout) {
-        this(false, timeoutSettings, timeout);
-    }
-
     private TimeoutContext(final boolean isMaintenanceContext,
                            final TimeoutSettings timeoutSettings,
                            @Nullable final Timeout timeout) {
@@ -139,6 +140,7 @@ public class TimeoutContext {
                            final TimeoutSettings timeoutSettings,
                            @Nullable final MaxTimeSupplier maxTimeSupplier,
                            @Nullable final Timeout timeout) {
+        assertTrue((timeoutSettings.getTimeoutMS() == null) == (timeout == null));
         this.isMaintenanceContext = isMaintenanceContext;
         this.timeoutSettings = timeoutSettings;
         this.minRoundTripTimeMS = minRoundTripTimeMS;
@@ -149,7 +151,8 @@ public class TimeoutContext {
     /**
      * Allows for the differentiation between users explicitly setting a global operation timeout via {@code timeoutMS}.
      *
-     * @return true if a timeout has been set.
+     * @return true iff {@link #getTimeoutSettings()}{@code .}{@link TimeoutSettings#getTimeoutMS() getTimeoutMS()} is not {@code null}.
+     * @see #getTimeout()
      */
     public boolean hasTimeoutMS() {
         return timeoutSettings.getTimeoutMS() != null;
@@ -170,12 +173,12 @@ public class TimeoutContext {
 
     /**
      * Returns the remaining {@code timeoutMS} if set or the {@code alternativeTimeoutMS}.
-     *
      * zero means infinite timeout.
      *
      * @param alternativeTimeoutMS the alternative timeout.
      * @return timeout to use.
      */
+    @VisibleForTesting(otherwise = PRIVATE)
     public long timeoutOrAlternative(final long alternativeTimeoutMS) {
         if (timeout == null) {
             return alternativeTimeoutMS;
@@ -183,7 +186,7 @@ public class TimeoutContext {
             return timeout.call(MILLISECONDS,
                     () -> 0L,
                     (ms) -> ms,
-                    () -> throwMongoTimeoutException("The operation exceeded the timeout limit."));
+                    () -> throwMongoTimeoutException());
         }
     }
 
@@ -191,6 +194,10 @@ public class TimeoutContext {
         return timeoutSettings;
     }
 
+    /**
+     * @return {@code null} iff {@link #hasTimeoutMS()} is {@code false}.
+     * @see #hasTimeoutMS()
+     */
     @Nullable
     public Timeout getTimeout() {
         return timeout;
@@ -223,7 +230,7 @@ public class TimeoutContext {
         return Math.toIntExact(Timeout.nullAsInfinite(timeout).call(MILLISECONDS,
                 () -> connectTimeoutMS,
                 (ms) -> connectTimeoutMS == 0 ? ms : Math.min(ms, connectTimeoutMS),
-                () -> throwMongoTimeoutException("The operation exceeded the timeout limit.")));
+                () -> throwMongoTimeoutException()));
     }
 
     /**
@@ -244,13 +251,11 @@ public class TimeoutContext {
      * The override will be provided as the remaining value in
      * {@link #runMaxTimeMS}, where 0 is ignored. This is useful for setting timeout
      * in {@link CommandMessage} as an extra element before we send it to the server.
-     *
      * <p>
-     * NOTE: Suitable for static user-defined values only (i.e MaxAwaitTimeMS),
+     * Suitable for static user-defined values only (i.e. {@code MaxAwaitTimeMS}),
      * not for running timeouts that adjust dynamically (CSOT).
-     *
+     * <p>
      * If remaining CSOT timeout is less than this static timeout, then CSOT timeout will be used.
-     *
      */
     public TimeoutContext withMaxTimeOverride(final long maxTimeMS) {
         return new TimeoutContext(
@@ -380,11 +385,6 @@ public class TimeoutContext {
         return new TimeoutContext(timeoutSettings.withReadTimeoutMS(newReadTimeout > 0 ? newReadTimeout : Long.MAX_VALUE));
     }
 
-    // Creates a copy of the timeout context that can be reset without resetting the original.
-    public TimeoutContext copyTimeoutContext() {
-        return new TimeoutContext(getTimeoutSettings(), getTimeout());
-    }
-
     @Override
     public String toString() {
         return "TimeoutContext{"
@@ -479,10 +479,10 @@ public class TimeoutContext {
             timeout.run(MILLISECONDS, () -> {
                         onRemaining.accept(fixedMs);
                     },
-                    (renamingMs) -> {
-                        onRemaining.accept(Math.min(renamingMs, fixedMs));
+                    (remainingMs) -> {
+                        onRemaining.accept(Math.min(remainingMs, fixedMs));
                     }, () -> {
-                        throwMongoTimeoutException("The operation exceeded the timeout limit.");
+                        throwMongoTimeoutException();
                     });
         } else {
             onRemaining.accept(fixedMs);

@@ -190,9 +190,14 @@ class SyncClientSession implements ClientSession {
     }
 
     @Override
+    public Object getOverloadRetryPolicyState() {
+        return wrapped.getOverloadRetryPolicyState();
+    }
+
+    @Override
     @Nullable
     public TransactionSpan getTransactionSpan() {
-        return null;
+        return wrapped.getTransactionSpan();
     }
 
     private static void sleep(final long millis) {
